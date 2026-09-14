@@ -1,0 +1,10 @@
+[package]
+name = "clob"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = "0.4.45"
+rust_decimal = { version = "1.43", features = ["macros"] }
+serde = "1.0.229"
+tokio = { version = "1", features = ["full"] }
