@@ -2,6 +2,7 @@ use rust_decimal::Decimal;
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Trade {
+    pub id: i32,
     pub buy_order_id: i32,
     pub sell_order_id: i32,
     pub price: Decimal,
@@ -19,6 +20,7 @@ mod test {
     fn trade_struct_construction() {
         let now = Utc::now();
         let trade = Trade {
+            id: 1,
             buy_order_id: 1,
             sell_order_id: 2,
             price: dec!(52000.5),
@@ -33,6 +35,7 @@ mod test {
     fn trade_ordering_trade_by_timestamp() {
         let mut trades = vec![
             Trade {
+                id: 1,
                 buy_order_id: 1,
                 sell_order_id: 2,
                 price: dec!(10),
@@ -40,6 +43,7 @@ mod test {
                 timestamp: 3000,
             },
             Trade {
+                id: 2,
                 buy_order_id: 1,
                 sell_order_id: 3,
                 price: dec!(10),
@@ -47,6 +51,7 @@ mod test {
                 timestamp: 1000,
             },
             Trade {
+                id: 3,
                 buy_order_id: 2,
                 sell_order_id: 4,
                 price: dec!(10),

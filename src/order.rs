@@ -12,12 +12,14 @@ pub enum OrderExcType {
     Limit,
     Market,
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderStatus {
     Open,
     PartiallyFilled,
     Filled,
     Canceled,
     Expired,
+    Rejected,
 }
 #[derive(Debug)]
 pub struct OrderPointer {
@@ -32,7 +34,7 @@ pub struct Order {
     pub exc_type: OrderExcType,
     pub price: Option<Decimal>, // Optional because it may be market(None) or limit(Some) order
     pub qty: Decimal,
-    pub filled_qty: Decimal,
+    pub status: OrderStatus,
     pub timestamp: DateTime<Utc>,
     pub expiration: DateTime<Utc>,
 }
@@ -51,7 +53,7 @@ mod test {
             exc_type: OrderExcType::Limit,
             price: Some(dec!(52000.5)),
             qty: dec!(1.5),
-            filled_qty: dec!(0.0),
+            status: OrderStatus::Open,
             timestamp: now,
             expiration: now + Duration::days(1),
         };
@@ -71,7 +73,7 @@ mod test {
             exc_type: OrderExcType::Market,
             price: Some(dec!(12.5)),
             qty: dec!(3.5),
-            filled_qty: dec!(0),
+            status: OrderStatus::Open,
             timestamp: time,
             expiration: time + Duration::days(1),
         };
