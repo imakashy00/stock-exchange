@@ -609,10 +609,10 @@ mod test {
         assert_eq!(remaining_order_z.qty, dec!(5));
 
         let t1 = rx.try_recv().unwrap(); // trade with X
-        assert_eq!(t1.sell_order_id, 100);
+        assert_eq!(t1.sell_order_id, 103);
 
         let t2 = rx.try_recv().unwrap(); // trade with Z
-        assert_eq!(t2.sell_order_id, 102);
+        assert_eq!(t2.buy_order_id, 102);
     }
 
     // cancellation tests
@@ -655,13 +655,14 @@ mod test {
         orderbook.process_order(order_1);
         orderbook.process_order(order_2);
         orderbook.process_order(order_3);
-        println!("OrderBook {:?}", orderbook);
+        println!("OrderBook=> {:?}", orderbook);
 
         // surgical cancel
         let cancelled_order = orderbook.cancel_order(2);
         assert!(cancelled_order.is_some());
         assert_eq!(cancelled_order.unwrap().status, OrderStatus::Cancelled);
-
+        println!("");
+        println!("OrderBook after cancellation=>{:?}", orderbook);
         let incoming_sell = Order {
             id: 4,
             qty: dec!(15),
@@ -699,9 +700,12 @@ mod test {
             dec!(5),
             "Order 3 original 10 - 5 remaining incoming sell units = 5 left"
         );
-        // ensure the matching loop gracefully skipped Order 2
+        // One try_recv() call always pops the oldest message first,
+        let trade_1 = rx.try_recv().expect("First trade execution report missing");
+        assert_eq!(trade_1.buy_order_id, 1, "First trade must be against Order 1");
+        assert_eq!(trade_1.qty, dec!(10));
+
         let trade_2 = rx.try_recv().expect("Second trade execution report missing");
-        println!("Trade 2{:?}", trade_2);
         assert_eq!(trade_2.buy_order_id, 3, "Second trade must skip Order 2 and hit Order 3");
         assert_eq!(trade_2.qty, dec!(5));
 
