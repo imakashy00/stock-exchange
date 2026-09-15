@@ -17,7 +17,7 @@ pub enum OrderStatus {
     Open,
     PartiallyFilled,
     Filled,
-    Canceled,
+    Cancelled,
     Expired,
     Rejected,
 }

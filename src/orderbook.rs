@@ -4,7 +4,6 @@ use std::{
     sync::mpsc::Sender,
 };
 use std::collections::btree_map::Entry;
-use chrono::Utc;
 use rust_decimal::{ Decimal, dec };
 
 use crate::{ order::{ Order, OrderExcType, OrderPointer, OrderStatus, OrderType }, trade::Trade };
@@ -97,7 +96,7 @@ impl OrderBook {
         None
     }
     // Cancel Order operation
-    pub fn remove_order(&mut self, order_id: i32) -> Option<Order> {
+    fn remove_order(&mut self, order_id: i32) -> Option<Order> {
         let pointer = self.order_index.remove(&order_id)?; // if not found returns None
         // route to the correct BTreeMap
         let order = match pointer.order_type {
@@ -130,7 +129,7 @@ impl OrderBook {
 
     pub fn cancel_order(&mut self, order_id: i32) -> Option<Order> {
         let mut order = self.remove_order(order_id)?;
-        order.status = OrderStatus::Canceled;
+        order.status = OrderStatus::Cancelled;
         Some(order)
     }
 
@@ -152,6 +151,7 @@ impl OrderBook {
                         filled_qty,
                         cancelled_qty
                     );
+                    incoming_order.status = OrderStatus::Cancelled;
                 }
             }
         } else {
@@ -214,6 +214,7 @@ impl OrderBook {
                     }
                     while !queue.is_empty() && incoming_order.qty > dec!(0) {
                         let resting_order = queue.front_mut().unwrap();
+                        self.trade_counter += 1;
                         let trade = execute_trade(
                             self.trade_counter,
                             resting_order,
@@ -248,7 +249,7 @@ mod test {
     use crate::order::{ OrderExcType, OrderStatus };
 
     use super::*;
-    use chrono::Utc;
+    use chrono::{ Duration, Utc };
     use rust_decimal::dec;
     use std::{ cmp::Reverse, sync::mpsc };
     fn make_order(id: i32, order_type: OrderType, price: Decimal) -> Order {
@@ -262,6 +263,18 @@ mod test {
             timestamp: Utc::now(),
             expiration: Utc::now(),
         }
+    }
+    // setup the order book
+    fn setup_test_orderbook() -> (OrderBook, mpsc::Receiver<Trade>) {
+        let (tx, rx) = mpsc::channel::<Trade>();
+        let orderbook = OrderBook {
+            trade_counter: 0,
+            asks: BTreeMap::new(),
+            bids: BTreeMap::new(),
+            order_index: HashMap::new(),
+            trade_sender: tx,
+        };
+        (orderbook, rx)
     }
     #[test]
     fn test_insert_bid_order() {
@@ -405,5 +418,327 @@ mod test {
         let best_bid = orderbook.best_bid().expect("Should find a best bid.");
         assert_eq!(best_bid.id, first_bid.id);
         assert_eq!(best_bid.price, Some(price));
+    }
+    // phase 3 tests matching algorithm
+    #[test]
+    fn test_price_time_priority_fifo() {
+        let (mut ordebook, rx) = setup_test_orderbook();
+        // insert two rest order on same price
+        let order1 = Order {
+            id: 1,
+            price: Some(dec!(100.0)),
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            qty: dec!(40),
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(5),
+        };
+        let order2 = Order {
+            id: 2,
+            price: Some(dec!(100.0)),
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            qty: dec!(10),
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(5),
+        };
+        ordebook.process_order(order1);
+        ordebook.process_order(order2);
+
+        // now incoming sell order
+        let sell_order = Order {
+            id: 3,
+            order_type: OrderType::Ask,
+            exc_type: OrderExcType::Limit,
+            price: Some(dec!(100.0)),
+            qty: dec!(45),
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(5),
+        };
+        let returned_sell = ordebook.process_order(sell_order);
+        // returned sell order should completely be filled
+        assert_eq!(returned_sell.status, OrderStatus::Filled);
+        assert_eq!(returned_sell.qty, dec!(0));
+        // first order should not be there and second order should be there and its qty should be 5
+        assert!(ordebook.order_index.get(&1).is_none());
+        assert!(ordebook.order_index.get(&2).is_some());
+        let queue = ordebook.bids
+            .get(&Reverse(dec!(100.0)))
+            .expect("Orderbook must contain the left orders.");
+        assert_eq!(queue[0].qty, dec!(5));
+        assert_eq!(queue[0].id, 2);
+
+        let trade = rx.try_recv().expect("First trade execution report missing.");
+        assert_eq!(trade.buy_order_id, 1);
+        assert_eq!(trade.sell_order_id, 3);
+        assert_eq!(trade.price, dec!(100.0));
+        assert_eq!(trade.qty, dec!(40));
+
+        let trade_2 = rx.try_recv().expect("Second trade execution report missing");
+        assert_eq!(trade_2.buy_order_id, 2);
+        assert_eq!(trade.price, dec!(100.0));
+        assert_eq!(trade.sell_order_id, 3);
+        assert_eq!(trade_2.qty, dec!(5));
+        assert!(rx.try_recv().is_err(), "There should be no third trade in the channel");
+    }
+    #[test]
+    fn test_market_order_multilevel_sweep_and_expiry() {
+        let (mut orderbook, rx) = setup_test_orderbook();
+        let ask_level_1 = Order {
+            id: 10,
+            qty: dec!(5),
+            price: Some(dec!(101)),
+            order_type: OrderType::Ask,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        let ask_level_2 = Order {
+            id: 11,
+            qty: dec!(10),
+            price: Some(dec!(102)),
+            order_type: OrderType::Ask,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        orderbook.process_order(ask_level_1);
+        orderbook.process_order(ask_level_2);
+
+        // oversize market order
+        let market_buy = Order {
+            id: 12,
+            qty: dec!(20),
+            price: None,
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Market,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        let returned_buy = orderbook.process_order(market_buy);
+        // rest orders should be cancelled
+        assert_eq!(returned_buy.status, OrderStatus::Cancelled);
+        assert_eq!(returned_buy.qty, dec!(5));
+        assert!(orderbook.order_index.get(&11).is_none());
+
+        // orderbook should be empty for bids
+        assert!(orderbook.bids.is_empty());
+
+        let trade_1 = rx.try_recv().unwrap();
+        assert_eq!(trade_1.price, dec!(101));
+        assert_eq!(trade_1.qty, dec!(5));
+
+        let trade_2 = rx.try_recv().unwrap();
+        assert_eq!(trade_2.price, dec!(102));
+        assert_eq!(trade_2.qty, dec!(10));
+
+        assert!(rx.try_recv().is_err(), "No more trades should exist");
+    }
+    #[test]
+    fn test_time_priority_preservation_after_middle_queue_cancel() {
+        let (mut orderbook, rx) = setup_test_orderbook();
+
+        let order_x = Order {
+            id: 100,
+            qty: dec!(10),
+            price: Some(dec!(50)),
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        let order_y = Order {
+            id: 101,
+            qty: dec!(10),
+            price: Some(dec!(50)),
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        let order_z = Order {
+            id: 102,
+            qty: dec!(10),
+            price: Some(dec!(50)),
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        orderbook.process_order(order_x);
+        orderbook.process_order(order_y);
+        orderbook.process_order(order_z);
+
+        let cancelled = orderbook
+            .cancel_order(101)
+            .expect("Cancellation should return the modified order instance");
+        assert_eq!(cancelled.status, OrderStatus::Cancelled);
+
+        let inbound_sell = Order {
+            id: 103,
+            qty: dec!(15),
+            price: Some(dec!(50)),
+            order_type: OrderType::Ask,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        orderbook.process_order(inbound_sell);
+
+        // assertions
+        // x should be filled y is absent so z should take rest of orders
+        assert!(orderbook.order_index.get(&100).is_none());
+        assert!(orderbook.order_index.get(&101).is_none());
+
+        let remaining_order_z = orderbook.bids
+            .get(&Reverse(dec!(50)))
+            .unwrap()
+            .front()
+            .unwrap();
+        assert_eq!(remaining_order_z.id, 102);
+        assert_eq!(remaining_order_z.qty, dec!(5));
+
+        let t1 = rx.try_recv().unwrap(); // trade with X
+        assert_eq!(t1.sell_order_id, 100);
+
+        let t2 = rx.try_recv().unwrap(); // trade with Z
+        assert_eq!(t2.sell_order_id, 102);
+    }
+
+    // cancellation tests
+    #[test]
+    fn test_time_priority_preservation_after_middle_cancel() {
+        let (mut orderbook, rx) = setup_test_orderbook();
+
+        // 1. Queue up three separate limit buy orders at the exact same price ($100)
+        let order_1 = Order {
+            id: 1,
+            qty: dec!(10),
+            price: Some(dec!(100)),
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        let order_2 = Order {
+            id: 2,
+            qty: dec!(10),
+            price: Some(dec!(100)),
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        let order_3 = Order {
+            id: 3,
+            qty: dec!(10),
+            price: Some(dec!(100)),
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+
+        orderbook.process_order(order_1);
+        orderbook.process_order(order_2);
+        orderbook.process_order(order_3);
+        println!("OrderBook {:?}", orderbook);
+
+        // surgical cancel
+        let cancelled_order = orderbook.cancel_order(2);
+        assert!(cancelled_order.is_some());
+        assert_eq!(cancelled_order.unwrap().status, OrderStatus::Cancelled);
+
+        let incoming_sell = Order {
+            id: 4,
+            qty: dec!(15),
+            price: Some(dec!(100)),
+            order_type: OrderType::Ask,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        orderbook.process_order(incoming_sell);
+        println!("After processing sell-->");
+        println!("OrderBook {:?}", orderbook);
+
+        assert!(
+            orderbook.order_index.get(&1).is_none(),
+            "Order 1 should be fully filled and removed"
+        );
+        assert!(
+            orderbook.order_index.get(&2).is_none(),
+            "Order 2 was canceled and should remain removed"
+        );
+        assert!(
+            orderbook.order_index.get(&3).is_some(),
+            "Order 3 must still exist in the index map"
+        );
+
+        let queue = orderbook.bids.get(&Reverse(dec!(100))).expect("Price level $100 must exist");
+        println!("QUEUE {:?}", queue);
+
+        assert_eq!(queue.len(), 1, "Only Order 3 should be left in this queue");
+        assert_eq!(queue[0].id, 3, "Order 3 must have preserved its position and shifted forward");
+        assert_eq!(
+            queue[0].qty,
+            dec!(5),
+            "Order 3 original 10 - 5 remaining incoming sell units = 5 left"
+        );
+        // ensure the matching loop gracefully skipped Order 2
+        let trade_2 = rx.try_recv().expect("Second trade execution report missing");
+        println!("Trade 2{:?}", trade_2);
+        assert_eq!(trade_2.buy_order_id, 3, "Second trade must skip Order 2 and hit Order 3");
+        assert_eq!(trade_2.qty, dec!(5));
+
+        assert!(rx.try_recv().is_err(), "No more trades should exist in the channel buffer");
+    }
+
+    // Too-Late Cancel
+    #[test]
+    fn test_too_late_cancel_on_fully_executed_order() {
+        let (mut orderbook, rx) = setup_test_orderbook();
+        let resting_ask = Order {
+            id: 50,
+            qty: dec!(10),
+            price: Some(dec!(200)),
+            order_type: OrderType::Ask,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        orderbook.process_order(resting_ask);
+        let incoming_bid = Order {
+            id: 51,
+            qty: dec!(10),
+            price: Some(dec!(200)),
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        orderbook.process_order(incoming_bid);
+
+        let cancelled_order = orderbook.cancel_order(50);
+        assert!(
+            cancelled_order.is_none(),
+            "A cancel command sent to an already filled order must return None gracefully"
+        );
     }
 }
