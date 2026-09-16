@@ -141,6 +141,9 @@ impl OrderBook {
         if incoming_order.qty > dec!(0) {
             match incoming_order.exc_type {
                 OrderExcType::Limit => {
+                    if incoming_order.qty < original_qty {
+                        incoming_order.status = OrderStatus::PartiallyFilled;
+                    }
                     self.insert_order(incoming_order);
                 }
                 OrderExcType::Market => {
@@ -246,11 +249,12 @@ impl OrderBook {
 
 #[cfg(test)]
 mod test {
-    use crate::order::{ OrderExcType, OrderStatus };
+    use crate::{ logger::Logger, order::{ OrderExcType, OrderStatus } };
 
     use super::*;
     use chrono::{ Duration, Utc };
     use rust_decimal::dec;
+    use tokio::fs;
     use std::{ cmp::Reverse, sync::mpsc };
     fn make_order(id: i32, order_type: OrderType, price: Decimal) -> Order {
         Order {
@@ -715,7 +719,7 @@ mod test {
     // Too-Late Cancel
     #[test]
     fn test_too_late_cancel_on_fully_executed_order() {
-        let (mut orderbook, rx) = setup_test_orderbook();
+        let (mut orderbook, _rx) = setup_test_orderbook();
         let resting_ask = Order {
             id: 50,
             qty: dec!(10),
@@ -744,5 +748,55 @@ mod test {
             cancelled_order.is_none(),
             "A cancel command sent to an already filled order must return None gracefully"
         );
+    }
+    // test end to end function
+    #[test]
+    fn test_end_to_end_matching_to_file_logging() {
+        let (mut order_book, rx) = setup_test_orderbook();
+
+        let test_log_file_path = "test.log";
+        let _ = fs::remove_file(test_log_file_path);
+
+        let logger = Logger::new(test_log_file_path);
+        let log_hanlde = logger.spawn_worker(rx);
+
+        let resting_order = Order {
+            id: 101,
+            order_type: OrderType::Ask,
+            exc_type: OrderExcType::Limit,
+            price: Some(dec!(150.5)),
+            qty: dec!(20),
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        order_book.process_order(resting_order);
+        let aggressive_bid = Order {
+            id: 202,
+            order_type: OrderType::Bid,
+            exc_type: OrderExcType::Limit,
+            price: Some(dec!(150.5)),
+            qty: dec!(20),
+            status: OrderStatus::Open,
+            timestamp: Utc::now(),
+            expiration: Utc::now() + Duration::minutes(2),
+        };
+        let processed_order = order_book.process_order(aggressive_bid);
+
+        assert_eq!(processed_order.status, OrderStatus::Filled);
+        assert_eq!(processed_order.qty, dec!(0));
+
+        // 7. GRACEFUL SHUTDOWN: Drop the order book to close the channel sender.
+        // This causes the background thread's `for trade in rx` loop to exit cleanly.
+        drop(order_book);
+
+        log_hanlde.join().expect("Logging hadle paniked!");
+
+        let file_contents = std::fs
+            ::read_to_string(test_log_file_path)
+            .expect("Failed to read test log file");
+        println!("Written content to file: \n{}", file_contents);
+        assert!(file_contents.contains("1,202,101,150.5,20,123456789"));
+        std::fs::remove_file(test_log_file_path).unwrap();
     }
 }

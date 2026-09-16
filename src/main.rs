@@ -14,35 +14,18 @@ use crate::{
     order::{ Order, OrderExcType, OrderStatus, OrderType },
     orderbook::OrderBook,
     trade::Trade,
+    logger::Logger,
 };
 
 mod order;
 mod trade;
 mod orderbook;
-use std::thread;
-
-fn start_trade_logger(rx: mpsc::Receiver<Trade>) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        // This loop blocks efficiently until a trade is received.
-        // It exits automatically if the OrderBook drops its sender.
-        for trade in rx {
-            // Write to file, print to console, or save to DB here
-            println!(
-                "[Background Worker] Executed Trade #{}: Sold {} shares at ${} between Buyer {} and Seller {}",
-                trade.id,
-                trade.qty,
-                trade.price,
-                trade.buy_order_id,
-                trade.sell_order_id
-            );
-        }
-        println!("[Background Worker] Channel closed. Thread shutting down cleanly.");
-    })
-}
+mod logger;
 
 fn main() {
     let (tx, rx) = mpsc::channel::<Trade>();
-    let _logg_handle = start_trade_logger(rx);
+    let logger = Logger::new("trade.log");
+    let _logg_handle = logger.spawn_worker(rx);
     let mut order_book = OrderBook {
         trade_counter: 0,
         asks: BTreeMap::new(),
